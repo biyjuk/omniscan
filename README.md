@@ -1,11 +1,10 @@
 # OmniScan (Android)
 
-Senior-friendly camera app: point at text, signs or a medicine pack and read it in large print or hear it aloud.
+Senior-friendly camera app. It reads ONLY what is inside the white frame on the camera view.
 
-- Auto-scan with on-device OCR (English + Hindi/Marathi script)
-- Signs: large-text overlay, translation to 18 languages, hazard alerts
-- Medicine packs: what it is used for (common medicines), what it contains, how-to-use and warning lines, expiry alert, label completeness check (batch, dates, manufacturer, licence, barcode/QR)
-- Listen button (text-to-speech), Pause to freeze, text size and language buttons
+- Signs: dominant (largest) text only, large print, translation to 18 languages, hazard alerts
+- Medicine packs: name, strength, what it is used for (common medicines), how-to-use and warning lines, expiry banner, label completeness check
+- Listen (text-to-speech), Pause (freeze), text size, language and script buttons
 
-Build: push to GitHub, open the Actions tab, run "Build OmniScan APK", download the `OmniScan-debug-apk` artifact.
+Build: push to GitHub, open Actions, run "Build OmniScan APK", download the `OmniScan-debug-apk` artifact.
 Translation needs internet once per language (model download); OCR works offline.
