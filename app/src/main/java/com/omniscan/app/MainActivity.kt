@@ -3,7 +3,9 @@ package com.omniscan.app
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.SystemClock
@@ -19,7 +21,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
@@ -35,6 +36,7 @@ import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -54,6 +56,7 @@ class MainActivity : AppCompatActivity() {
     private val sizes = intArrayOf(22, 28, 34, 40)
 
     private lateinit var preview: PreviewView
+    private lateinit var viewfinder: View
     private lateinit var statusText: TextView
     private lateinit var banner: TextView
     private lateinit var scroll: ScrollView
@@ -74,6 +77,10 @@ class MainActivity : AppCompatActivity() {
     private var lastRun = 0L
     private var lastKey = ""
     private var lastWords: Set<String> = emptySet()
+    private var pendingWords: Set<String> = emptySet()
+    private var pendingMedKey = ""
+    @Volatile private var frameFrac = floatArrayOf(0.05f, 0.1f, 0.95f, 0.9f)
+    @Volatile private var viewAspect = 0.6f
     private var gen = 0
     private var currentSpeech = ""
 
@@ -89,7 +96,7 @@ class MainActivity : AppCompatActivity() {
     private var speaking = false
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) startCamera() else statusText.text = "Camera permission is needed. Tap the screen to try again."
+        if (granted) startCamera() else statusText.text = "Camera permission is needed. Tap here to try again."
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -97,6 +104,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         preview = findViewById(R.id.preview)
+        viewfinder = findViewById(R.id.viewfinder)
         statusText = findViewById(R.id.statusText)
         banner = findViewById(R.id.banner)
         scroll = findViewById(R.id.scroll)
@@ -112,6 +120,9 @@ class MainActivity : AppCompatActivity() {
         sizeIdx = prefs.getInt("size", 1).coerceIn(0, sizes.size - 1)
         devanagari = prefs.getBoolean("deva", false)
         applyUi()
+
+        viewfinder.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateFrame() }
+        preview.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateFrame() }
 
         btnLang.setOnClickListener { chooseLanguage() }
         btnSize.setOnClickListener {
@@ -129,7 +140,7 @@ class MainActivity : AppCompatActivity() {
         btnPause.setOnClickListener {
             paused = !paused
             btnPause.text = if (paused) "Resume" else "Pause"
-            statusText.text = if (paused) "Paused. Text will stay on screen." else "Scanning…"
+            statusText.text = if (paused) "Paused. Text will stay on screen." else "Scanning inside the frame…"
         }
         btnListen.setOnClickListener { toggleSpeech() }
         statusText.setOnClickListener { ensureCamera() }
@@ -217,48 +228,101 @@ class MainActivity : AppCompatActivity() {
                     .also { it.setAnalyzer(analysisExecutor) { proxy -> analyze(proxy) } }
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, previewUse, analysis)
-                statusText.text = "Scanning…"
+                statusText.text = "Scanning inside the frame…"
             } catch (e: Exception) {
                 statusText.text = "Could not start the camera"
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @OptIn(ExperimentalGetImage::class)
+    /** Keeps the frame rectangle (as fractions of the preview) in sync with the layout. */
+    private fun updateFrame() {
+        val pw = preview.width
+        val ph = preview.height
+        if (pw == 0 || ph == 0 || viewfinder.width == 0) return
+        fun fx(v: Int) = ((v - preview.left).toFloat() / pw).coerceIn(0f, 1f)
+        fun fy(v: Int) = ((v - preview.top).toFloat() / ph).coerceIn(0f, 1f)
+        frameFrac = floatArrayOf(fx(viewfinder.left), fy(viewfinder.top), fx(viewfinder.right), fy(viewfinder.bottom))
+        viewAspect = pw.toFloat() / ph
+    }
+
+    /** Crops the camera frame to exactly what is inside the on-screen frame. */
+    private fun cropToFrame(proxy: ImageProxy): Bitmap {
+        val src = proxy.toBitmap()
+        val m = Matrix().apply { postRotate(proxy.imageInfo.rotationDegrees.toFloat()) }
+        val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
+        val bw = rotated.width
+        val bh = rotated.height
+        val va = viewAspect
+        // Preview uses FILL_CENTER, so the visible area is a centred crop with the view's aspect ratio
+        var vw = bw
+        var vh = bh
+        if (bw.toFloat() / bh > va) vw = (bh * va).toInt() else vh = (bw / va).toInt()
+        val vx = (bw - vw) / 2
+        val vy = (bh - vh) / 2
+        val f = frameFrac
+        val x = (vx + f[0] * vw).toInt().coerceIn(0, bw - 2)
+        val y = (vy + f[1] * vh).toInt().coerceIn(0, bh - 2)
+        val w = ((f[2] - f[0]) * vw).toInt().coerceIn(1, bw - x)
+        val h = ((f[3] - f[1]) * vh).toInt().coerceIn(1, bh - y)
+        return Bitmap.createBitmap(rotated, x, y, w, h)
+    }
+
     private fun analyze(proxy: ImageProxy) {
-        val media = proxy.image
         val now = SystemClock.elapsedRealtime()
-        if (media == null || paused || busy || now - lastRun < 1200) {
+        if (paused || busy || now - lastRun < 1200) {
             proxy.close()
             return
         }
         busy = true
         lastRun = now
-        val input = InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees)
+        val bmp = try {
+            cropToFrame(proxy)
+        } catch (e: Exception) {
+            null
+        }
+        proxy.close()
+        if (bmp == null) {
+            busy = false
+            return
+        }
+        val input = InputImage.fromBitmap(bmp, 0)
         val recognizer = if (devanagari) deva else latin
         recognizer.process(input)
             .addOnSuccessListener { result ->
-                val text = result.text.trim()
-                if (text.length < 3) {
-                    finishFrame(proxy)
-                } else if (MedicineParser.looksLikeMedicine(text)) {
+                val lines = cleanLines(result)
+                val allText = lines.joinToString("\n") { it.first }
+                if (allText.length < 3) {
+                    busy = false
+                } else if (MedicineParser.looksLikeMedicine(allText)) {
+                    val nameGuess = lines
+                        .filter { l -> l.first.count { ch -> ch.isLetter() } >= 4 }
+                        .maxByOrNull { l -> l.second }?.first
                     barcode.process(input).addOnCompleteListener { t ->
                         val hasCode = t.isSuccessful && !t.result.isNullOrEmpty()
-                        handleMedicine(text, hasCode)
-                        finishFrame(proxy)
+                        handleMedicine(allText, hasCode, nameGuess)
+                        busy = false
                     }
                 } else {
-                    handleSign(text)
-                    finishFrame(proxy)
+                    // Signs: keep only the dominant (largest) text, drop small background clutter
+                    val maxH = lines.maxOf { it.second }
+                    val main = lines.filter { it.second >= maxH * 0.5 }.joinToString("\n") { it.first }
+                    handleSign(main)
+                    busy = false
                 }
             }
-            .addOnFailureListener { finishFrame(proxy) }
+            .addOnFailureListener { busy = false }
     }
 
-    private fun finishFrame(proxy: ImageProxy) {
-        proxy.close()
-        busy = false
-    }
+    /** Text lines with their pixel height; drops garbage lines (mostly symbols/noise). */
+    private fun cleanLines(result: Text): List<Pair<String, Int>> =
+        result.textBlocks.flatMap { it.lines }
+            .mapNotNull { line ->
+                val box = line.boundingBox ?: return@mapNotNull null
+                val t = line.text.trim()
+                val good = t.count { ch -> ch.isLetterOrDigit() }
+                if (t.length >= 2 && good >= t.length * 0.6) Pair(t, box.height()) else null
+            }
 
     // ---------- Signs: translate + hazard alerts ----------
 
@@ -272,6 +336,10 @@ class MainActivity : AppCompatActivity() {
     private fun handleSign(text: String) {
         val words = text.lowercase().split(Regex("\\W+")).filter { it.length > 1 }.toSet()
         if (similar(words, lastWords)) return
+        if (!similar(words, pendingWords)) {
+            pendingWords = words   // wait for a second matching read to avoid flicker
+            return
+        }
         lastWords = words
         lastKey = ""
         val myGen = ++gen
@@ -301,13 +369,18 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- Medicine ----------
 
-    private fun handleMedicine(text: String, hasCode: Boolean) {
-        val info = MedicineParser.parse(text, hasCode)
+    private fun handleMedicine(text: String, hasCode: Boolean, nameGuess: String?) {
+        val info = MedicineParser.parse(text, hasCode, nameGuess)
         val summary = MedicineParser.summary(info)
         val key = "m:$summary|${info.expiryStatus}"
         if (key == lastKey) return
+        if (key != pendingMedKey) {
+            pendingMedKey = key   // show only after two matching reads
+            return
+        }
         lastKey = key
         lastWords = emptySet()
+        pendingWords = emptySet()
         val myGen = ++gen
         statusText.text = "Medicine label detected"
 

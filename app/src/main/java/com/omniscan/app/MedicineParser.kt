@@ -5,6 +5,7 @@ import java.util.Calendar
 enum class ExpiryStatus { EXPIRED, SOON, OK, UNKNOWN }
 
 data class MedicineInfo(
+    val name: String?,
     val known: List<Pair<String, String>>,
     val labelPurpose: List<String>,
     val composition: List<String>,
@@ -87,7 +88,7 @@ object MedicineParser {
         return score >= 3
     }
 
-    fun parse(text: String, hasCode: Boolean): MedicineInfo {
+    fun parse(text: String, hasCode: Boolean, nameGuess: String? = null): MedicineInfo {
         val lines = text.split('\n').map { it.trim() }.filter { it.isNotEmpty() }
         val lower = text.lowercase()
 
@@ -125,17 +126,18 @@ object MedicineParser {
         )
         val found = checks.count { it.second }
         val verdict = if (found >= 5) {
-            "Most printed details were found. This does NOT prove the medicine is genuine. Buy only from licensed pharmacies."
+            "Details look complete. This does not prove it is genuine."
         } else {
-            "Some details are missing or unclear. Move closer and scan again. If the pack looks unusual, ask your pharmacist."
+            "Some details missing. Move closer, or ask your pharmacist."
         }
 
         return MedicineInfo(
+            name = if (known.isEmpty()) nameGuess?.take(40) else null,
             known = known,
-            labelPurpose = pick(lines, purposeRegex, 3),
-            composition = pick(lines, doseRegex, 4),
-            usage = pick(lines, usageRegex, 4),
-            warnings = pick(lines, warnRegex, 4),
+            labelPurpose = if (known.isEmpty()) pick(lines, purposeRegex, 2) else emptyList(),
+            composition = pick(lines, doseRegex, 2),
+            usage = pick(lines, usageRegex, 2),
+            warnings = pick(lines, warnRegex, 2),
             expiryLabel = expText,
             expiryStatus = status,
             checks = checks,
@@ -151,27 +153,25 @@ object MedicineParser {
             items.forEach { sb.append(it).append('\n') }
             sb.append('\n')
         }
+        section("MEDICINE", listOfNotNull(i.name))
         section("USED FOR", i.known.map { it.first + ": " + it.second } + i.labelPurpose)
-        section("CONTAINS", i.composition)
-        val usage = i.usage.toMutableList()
-        if (usage.isNotEmpty()) usage.add("Follow your doctor's or pharmacist's advice.")
-        section("HOW TO USE", usage)
+        section("STRENGTH", i.composition)
+        section("HOW TO USE", i.usage)
         section("WARNINGS", i.warnings)
 
-        val found = i.checks.filter { it.second }.map { it.first }
+        val found = i.checks.count { it.second }
         val missing = i.checks.filter { !it.second }.map { it.first }
-        val check = mutableListOf<String>()
-        if (found.isNotEmpty()) check.add("Found: " + found.joinToString(", ") + ".")
+        val check = mutableListOf("$found of ${i.checks.size} label details found.")
         if (missing.isNotEmpty()) check.add("Not found: " + missing.joinToString(", ") + ".")
         check.add(i.verdict)
         section("LABEL CHECK", check)
 
-        sb.append("This only reads what is printed on the pack. It is not medical advice.")
+        sb.append("Printed label only. Not medical advice.")
         return sb.toString().trim()
     }
 
     private fun pick(lines: List<String>, regex: Regex, max: Int): List<String> =
-        lines.filter { regex.containsMatchIn(it) }.map { it.take(90) }.distinct().take(max)
+        lines.filter { regex.containsMatchIn(it) }.map { it.take(80) }.distinct().take(max)
 
     private fun findDate(label: Regex, text: String): Pair<Int, Int>? {
         for (m in label.findAll(text)) {
