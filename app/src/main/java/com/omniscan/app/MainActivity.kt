@@ -8,7 +8,6 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Size
@@ -56,7 +55,7 @@ class MainActivity : AppCompatActivity() {
     private val sizes = intArrayOf(22, 28, 34, 40)
 
     private lateinit var preview: PreviewView
-    private lateinit var viewfinder: View
+    private lateinit var selection: SelectionView
     private lateinit var statusText: TextView
     private lateinit var banner: TextView
     private lateinit var scroll: ScrollView
@@ -65,22 +64,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSize: MaterialButton
     private lateinit var btnScript: MaterialButton
     private lateinit var btnListen: MaterialButton
-    private lateinit var btnPause: MaterialButton
+    private lateinit var btnCheck: MaterialButton
 
     private val prefs by lazy { getSharedPreferences("omniscan", Context.MODE_PRIVATE) }
     private var targetLang = "en"
     private var sizeIdx = 1
     private var devanagari = false
 
-    @Volatile private var paused = false
+    // Check = read ONLY the selected box, once, when the user taps the button
+    @Volatile private var captureRequested = false
     @Volatile private var busy = false
-    private var lastRun = 0L
-    private var lastKey = ""
-    private var lastWords: Set<String> = emptySet()
-    private var pendingWords: Set<String> = emptySet()
-    private var pendingMedKey = ""
-    @Volatile private var frameFrac = floatArrayOf(0.05f, 0.1f, 0.95f, 0.9f)
-    @Volatile private var viewAspect = 0.6f
+    @Volatile private var frameFrac = floatArrayOf(0.1f, 0.25f, 0.9f, 0.75f)
+    @Volatile private var viewAspect = 0.75f
     private var gen = 0
     private var currentSpeech = ""
 
@@ -104,7 +99,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         preview = findViewById(R.id.preview)
-        viewfinder = findViewById(R.id.viewfinder)
+        selection = findViewById(R.id.selection)
         statusText = findViewById(R.id.statusText)
         banner = findViewById(R.id.banner)
         scroll = findViewById(R.id.scroll)
@@ -113,7 +108,7 @@ class MainActivity : AppCompatActivity() {
         btnSize = findViewById(R.id.btnSize)
         btnScript = findViewById(R.id.btnScript)
         btnListen = findViewById(R.id.btnListen)
-        btnPause = findViewById(R.id.btnPause)
+        btnCheck = findViewById(R.id.btnCheck)
 
         analysisExecutor = Executors.newSingleThreadExecutor()
         targetLang = prefs.getString("lang", "en") ?: "en"
@@ -121,7 +116,7 @@ class MainActivity : AppCompatActivity() {
         devanagari = prefs.getBoolean("deva", false)
         applyUi()
 
-        viewfinder.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateFrame() }
+        selection.onChanged = { updateFrame() }
         preview.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateFrame() }
 
         btnLang.setOnClickListener { chooseLanguage() }
@@ -133,14 +128,13 @@ class MainActivity : AppCompatActivity() {
         btnScript.setOnClickListener {
             devanagari = !devanagari
             prefs.edit().putBoolean("deva", devanagari).apply()
-            lastKey = ""
-            lastWords = emptySet()
             applyUi()
         }
-        btnPause.setOnClickListener {
-            paused = !paused
-            btnPause.text = if (paused) "Resume" else "Pause"
-            statusText.text = if (paused) "Paused. Text will stay on screen." else "Scanning inside the frame…"
+        btnCheck.setOnClickListener {
+            if (busy) return@setOnClickListener
+            updateFrame()
+            statusText.text = "Checking the selected area…"
+            captureRequested = true
         }
         btnListen.setOnClickListener { toggleSpeech() }
         statusText.setOnClickListener { ensureCamera() }
@@ -177,8 +171,6 @@ class MainActivity : AppCompatActivity() {
             .setItems(languages.map { it.second }.toTypedArray()) { _, i ->
                 targetLang = languages[i].first
                 prefs.edit().putString("lang", targetLang).apply()
-                lastKey = ""
-                lastWords = emptySet()
                 applyUi()
                 applyTtsLanguage()
             }
@@ -203,6 +195,7 @@ class MainActivity : AppCompatActivity() {
         showBanner(bannerMsg, bannerColor)
         currentSpeech = (if (bannerMsg != null) "$bannerMsg. " else "") + body
         scroll.scrollTo(0, 0)
+        statusText.text = "Done. Move the box and tap Check again."
     }
 
     // ---------- Camera ----------
@@ -228,26 +221,24 @@ class MainActivity : AppCompatActivity() {
                     .also { it.setAnalyzer(analysisExecutor) { proxy -> analyze(proxy) } }
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, previewUse, analysis)
-                statusText.text = "Scanning inside the frame…"
+                statusText.text = "Drag the box over the text, then tap Check"
             } catch (e: Exception) {
                 statusText.text = "Could not start the camera"
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Keeps the frame rectangle (as fractions of the preview) in sync with the layout. */
+    /** Keeps the selected box (as fractions of the preview) in sync. */
     private fun updateFrame() {
         val pw = preview.width
         val ph = preview.height
-        if (pw == 0 || ph == 0 || viewfinder.width == 0) return
-        fun fx(v: Int) = ((v - preview.left).toFloat() / pw).coerceIn(0f, 1f)
-        fun fy(v: Int) = ((v - preview.top).toFloat() / ph).coerceIn(0f, 1f)
-        frameFrac = floatArrayOf(fx(viewfinder.left), fy(viewfinder.top), fx(viewfinder.right), fy(viewfinder.bottom))
+        if (pw == 0 || ph == 0) return
+        frameFrac = selection.fractions()
         viewAspect = pw.toFloat() / ph
     }
 
-    /** Crops the camera frame to exactly what is inside the on-screen frame. */
-    private fun cropToFrame(proxy: ImageProxy): Bitmap {
+    /** Crops the camera frame to exactly the box the user selected. */
+    private fun cropToSelection(proxy: ImageProxy): Bitmap {
         val src = proxy.toBitmap()
         val m = Matrix().apply { postRotate(proxy.imageInfo.rotationDegrees.toFloat()) }
         val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
@@ -269,21 +260,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun analyze(proxy: ImageProxy) {
-        val now = SystemClock.elapsedRealtime()
-        if (paused || busy || now - lastRun < 1200) {
+        if (!captureRequested || busy) {
             proxy.close()
             return
         }
+        captureRequested = false
         busy = true
-        lastRun = now
         val bmp = try {
-            cropToFrame(proxy)
+            cropToSelection(proxy)
         } catch (e: Exception) {
             null
         }
         proxy.close()
         if (bmp == null) {
             busy = false
+            runOnUiThread { statusText.text = "Could not capture. Try again." }
             return
         }
         val input = InputImage.fromBitmap(bmp, 0)
@@ -292,8 +283,9 @@ class MainActivity : AppCompatActivity() {
             .addOnSuccessListener { result ->
                 val lines = cleanLines(result)
                 val allText = lines.joinToString("\n") { it.first }
-                if (allText.length < 3) {
+                if (allText.length < 2) {
                     busy = false
+                    statusText.text = "No text found in the box. Move it over the text and tap Check."
                 } else if (MedicineParser.looksLikeMedicine(allText)) {
                     val nameGuess = lines
                         .filter { l -> l.first.count { ch -> ch.isLetter() } >= 4 }
@@ -304,14 +296,14 @@ class MainActivity : AppCompatActivity() {
                         busy = false
                     }
                 } else {
-                    // Signs: keep only the dominant (largest) text, drop small background clutter
-                    val maxH = lines.maxOf { it.second }
-                    val main = lines.filter { it.second >= maxH * 0.5 }.joinToString("\n") { it.first }
-                    handleSign(main)
+                    handleSign(allText)
                     busy = false
                 }
             }
-            .addOnFailureListener { busy = false }
+            .addOnFailureListener {
+                busy = false
+                statusText.text = "Could not read the text. Try again."
+            }
     }
 
     /** Text lines with their pixel height; drops garbage lines (mostly symbols/noise). */
@@ -324,26 +316,11 @@ class MainActivity : AppCompatActivity() {
                 if (t.length >= 2 && good >= t.length * 0.6) Pair(t, box.height()) else null
             }
 
-    // ---------- Signs: translate + hazard alerts ----------
-
-    private fun similar(a: Set<String>, b: Set<String>): Boolean {
-        if (a.isEmpty() || b.isEmpty()) return false
-        val inter = a.intersect(b).size
-        val union = a.union(b).size
-        return inter.toFloat() / union >= 0.8f
-    }
+    // ---------- Text in the box: translate + hazard alerts ----------
 
     private fun handleSign(text: String) {
-        val words = text.lowercase().split(Regex("\\W+")).filter { it.length > 1 }.toSet()
-        if (similar(words, lastWords)) return
-        if (!similar(words, pendingWords)) {
-            pendingWords = words   // wait for a second matching read to avoid flicker
-            return
-        }
-        lastWords = words
-        lastKey = ""
         val myGen = ++gen
-        statusText.text = "Reading sign…"
+        statusText.text = "Reading…"
         langId.identifyLanguage(text)
             .addOnSuccessListener { tag ->
                 if (myGen != gen) return@addOnSuccessListener
@@ -360,7 +337,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showSign(body: String, forHazard: String, myGen: Int) {
-        statusText.text = "Sign detected"
         val hazard = HazardDetector.check(forHazard)
         localize(hazard) { msg ->
             if (myGen == gen) show(body, msg, Color.parseColor("#B91C1C"))
@@ -372,15 +348,6 @@ class MainActivity : AppCompatActivity() {
     private fun handleMedicine(text: String, hasCode: Boolean, nameGuess: String?) {
         val info = MedicineParser.parse(text, hasCode, nameGuess)
         val summary = MedicineParser.summary(info)
-        val key = "m:$summary|${info.expiryStatus}"
-        if (key == lastKey) return
-        if (key != pendingMedKey) {
-            pendingMedKey = key   // show only after two matching reads
-            return
-        }
-        lastKey = key
-        lastWords = emptySet()
-        pendingWords = emptySet()
         val myGen = ++gen
         statusText.text = "Medicine label detected"
 
@@ -396,7 +363,7 @@ class MainActivity : AppCompatActivity() {
         ExpiryStatus.EXPIRED -> "EXPIRED (${i.expiryLabel}). Do not use this medicine." to Color.parseColor("#B91C1C")
         ExpiryStatus.SOON -> "Expires soon: ${i.expiryLabel}. Check with your pharmacist." to Color.parseColor("#B45309")
         ExpiryStatus.OK -> "Not expired. Expiry: ${i.expiryLabel}." to Color.parseColor("#047857")
-        ExpiryStatus.UNKNOWN -> "Expiry date not found. Move closer and hold steady." to Color.parseColor("#475569")
+        ExpiryStatus.UNKNOWN -> "Expiry date not found in the box. Include the EXP line." to Color.parseColor("#475569")
     }
 
     // ---------- Translation ----------
